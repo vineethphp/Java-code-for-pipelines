@@ -1,0 +1,110 @@
+import com.google.cloud.pubsub.v1.AckReplyConsumer;
+import com.google.cloud.pubsub.v1.Subscriber;
+import com.google.pubsub.v1.ProjectSubscriptionName;
+import com.google.pubsub.v1.PubsubMessage;
+import com.google.cloud.datastore.*;
+import com.zaxxer.hikari.HikariConfig;
+import com.zaxxer.hikari.HikariDataSource;
+
+import java.sql.Connection;
+import java.sql.PreparedStatement;
+import java.sql.SQLException;
+import java.util.ArrayList;
+import java.util.List;
+import java.util.logging.Logger;
+import java.util.concurrent.*;
+
+public class PubSubProcessor {
+    private static final String PROJECT_ID = System.getenv("GCP_PROJECT_ID");
+    private static final String SUBSCRIPTION_ID = System.getenv("PUBSUB_SUBSCRIPTION_ID");
+    private static final String PGSQL_URL = System.getenv("PGSQL_URL");
+    private static final int BATCH_SIZE = 10;
+    private static final int MAX_DATASTORE_SIZE = 1000000;
+    private static final int SLICE_SIZE = 900000;
+
+    private static final Logger logger = Logger.getLogger(PubSubProcessor.class.getName());
+    private static final Datastore datastore = DatastoreOptions.getDefaultInstance().getService();
+    private static final HikariDataSource dataSource = createPgsqlConnectionPool();
+
+    private static HikariDataSource createPgsqlConnectionPool() {
+        HikariConfig config = new HikariConfig();
+        config.setJdbcUrl(PGSQL_URL);
+        config.setMaximumPoolSize(10);
+        return new HikariDataSource(config);
+    }
+
+    public static void main(String[] args) throws InterruptedException {
+        ProjectSubscriptionName subscriptionName = ProjectSubscriptionName.of(PROJECT_ID, SUBSCRIPTION_ID);
+        BlockingQueue<PubsubMessage> messageQueue = new LinkedBlockingQueue<>();
+
+        Subscriber subscriber = Subscriber.newBuilder(subscriptionName, (message, consumer) -> {
+            messageQueue.offer(message);
+            consumer.ack();
+        }).build();
+        subscriber.startAsync().awaitRunning();
+
+        ExecutorService executor = Executors.newSingleThreadExecutor();
+        executor.submit(() -> {
+            List<PubsubMessage> batch = new ArrayList<>();
+            while (true) {
+                batch.add(messageQueue.poll(1, TimeUnit.SECONDS));
+                if (batch.size() >= BATCH_SIZE || messageQueue.isEmpty()) {
+                    processBatch(batch);
+                    batch.clear();
+                }
+            }
+        });
+    }
+
+    private static void processBatch(List<PubsubMessage> batch) {
+        for (PubsubMessage message : batch) {
+            try {
+                String content = message.getData().toStringUtf8();
+                if (content.length() <= MAX_DATASTORE_SIZE) {
+                    Key key = datastore.newKeyFactory().setKind("Message").newKey();
+                    Entity entity = Entity.newBuilder(key)
+                            .set("content", content)
+                            .build();
+                    datastore.put(entity);
+                } else {
+                    logger.warning("Message too large for Datastore. Slicing...");
+                    sliceAndStoreInDatastore(content);
+                }
+            } catch (Exception e) {
+                logger.severe("Datastore error: " + e.getMessage());
+            }
+        }
+
+        try (Connection conn = dataSource.getConnection()) {
+            String query = "INSERT INTO messages (content) VALUES (?)";
+            try (PreparedStatement stmt = conn.prepareStatement(query)) {
+                for (PubsubMessage message : batch) {
+                    stmt.setString(1, message.getData().toStringUtf8());
+                    stmt.addBatch();
+                }
+                stmt.executeBatch();
+            }
+        } catch (SQLException e) {
+            logger.severe("PostgreSQL error: " + e.getMessage());
+        }
+    }
+
+    private static void sliceAndStoreInDatastore(String content) {
+        try {
+            int totalSlices = (content.length() + SLICE_SIZE - 1) / SLICE_SIZE;
+            for (int i = 0; i < totalSlices; i++) {
+                String slice = content.substring(i * SLICE_SIZE, Math.min((i + 1) * SLICE_SIZE, content.length()));
+                Key key = datastore.newKeyFactory().setKind("MessageSlice").newKey();
+                Entity entity = Entity.newBuilder(key)
+                        .set("content", slice)
+                        .set("slice_index", i)
+                        .set("total_slices", totalSlices)
+                        .build();
+                datastore.put(entity);
+            }
+            logger.info("Stored oversized message in " + totalSlices + " slices.");
+        } catch (Exception e) {
+            logger.severe("Error slicing message for Datastore: " + e.getMessage());
+        }
+    }
+}
